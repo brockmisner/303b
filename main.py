@@ -2557,7 +2557,8 @@ async def brain_loop(eq: asyncio.Queue) -> None:
 
                     decision = _spine.decide(features)
 
-                    if decision and not SIMULATION_MODE and not EXEC_LOCKED:
+                    _can_dispatch_exit = (not EXEC_LOCKED) or _is_stop_loss
+                    if decision and not SIMULATION_MODE and _can_dispatch_exit:
                         req = EXEC_FSM.request(decision, now_ms_val)
                         if req:
                             await eq.put(req)
