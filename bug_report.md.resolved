@@ -1,0 +1,169 @@
+# Bug Report — [main.py](file:///c:/Users/brock/Downloads/303-main/303-main/main.py) Code Review
+
+Full review of all 6,031 lines. Bugs ranked by **severity**: 🔴 High (money-at-risk), 🟡 Medium (logic/correctness), 🟢 Low (code quality).
+
+---
+
+## 🔴 Bug 1 — [maybe_request_flip](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#4191-4283) calls [early_sell_profit_gate](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#392-451) with wrong defaults
+
+**[main.py:4241-4245](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#L4241-L4245)**
+
+```python
+flip_ok, net_bid, req_bid = early_sell_profit_gate(
+    sec_remaining=T_sec,
+    bid=sell_bid,
+    entry_price=sell_entry,
+)
+```
+
+Missing `p_cone`, [side](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#933-936), and `T_entry`. Defaults to `p_cone=0.5`, `side="UP"`, `T_entry=0.0`:
+
+- **If flipping from DOWN→UP**, `p_side` uses `p_cone` directly instead of `1-p_cone` → **wrong exit target**, potentially blocking profitable flips or allowing unprofitable ones.
+- `T_entry=0.0` falls back to `230.0` internally — benign but imprecise.
+
+**Fix:**
+```python
+flip_ok, net_bid, req_bid = early_sell_profit_gate(
+    sec_remaining=T_sec,
+    bid=sell_bid,
+    entry_price=sell_entry,
+    p_cone=float(p_cone),
+    side=cur_side,
+    T_entry=max(1.0, 300.0 - T_sec),
+)
+```
+
+---
+
+## 🔴 Bug 2 — Flow tracker biased by unknown trade sides
+
+**[main.py:3171-3172](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#L3171-L3172)**
+
+```python
+side = msg.get("side")
+is_buy = True if side == "BUY" else False
+```
+
+When [side](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#933-936) is `None` (no field in message), `is_buy = False`. Every unknown-side trade is recorded as a **sell** in `FLOW.record_fill()`.
+
+**Impact:**
+- Biases `FLOW.imbalance()` toward negative (sell-heavy)
+- Can trigger incorrect `FLOW_ADVERSE_GATE` blocks on UP entries
+- Affects `flow_reversal` exit logic (line 4809)
+- Affects flow-weighted sizing via `_flow_sz_scale`
+
+**Fix:**
+```python
+side = msg.get("side")
+if side is None:
+    return  # skip flow recording for ambiguous trades
+is_buy = (side == "BUY")
+```
+
+---
+
+## 🔴 Bug 3 — `_sigma_ratio` variable shadowed mid-function
+
+`_sigma_ratio` assigned from `REGIME.sigma_ratio` at **line 5384**, used at **line 5524**:
+```python
+if _sigma_ratio < 0.6:
+    _kelly_base *= 0.8
+```
+
+Then **reassigned** at **line 5643** to a raw ratio:
+```python
+_sigma_ratio = STATE.sigma_fast / STATE.sigma_slow ...
+```
+
+These are **different quantities**. The log at line 5739 reports the raw ratio as if it were the regime ratio. If code is moved between these lines, wrong value used.
+
+**Fix:** Rename line 5643 to `_raw_sigma_ratio`.
+
+---
+
+## 🟡 Bug 4 — [survival_decide_portfolio](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#4069-4189) only exits one leg at expiry
+
+**[main.py:4114-4125](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#L4114-L4125)**
+
+When holding **both** UP and DOWN with ≤8s left, only UP is exited (first branch). DOWN only triggers if UP is zero or bookless. In a straddle, the DOWN leg wastes precious seconds.
+
+**Fix:** Prioritize larger leg:
+```python
+if sec_remaining <= 8:
+    legs = []
+    if A > 0 and bid_up > 0.01:
+        legs.append(("UP", UP_TOKEN_ID, A, bid_up))
+    if B > 0 and bid_dn > 0.01:
+        legs.append(("DOWN", DOWN_TOKEN_ID, B, bid_dn))
+    if legs:
+        legs.sort(key=lambda x: x[2], reverse=True)
+        side, tid, qty, bid = legs[0]
+        return {"action": "EXIT", "reason": "last_8s", ...}
+```
+
+---
+
+## 🟡 Bug 5 — Duplicate `CIRCUIT_BREAKER_ACTIVE` checks
+
+Checked at **line 4415** (top of loop) and again at **line 5412** (after fire gates). The survival engine at lines 4643–4902 runs *between* these checks, meaning exit orders can be queued during circuit breaker. This is probably intentional (exits should be allowed) but the intent is unclear and should be documented.
+
+---
+
+## 🟡 Bug 6 — IADL multi-order plans bypass `EXEC_LOCKED`
+
+**[main.py:5172](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#L5172)**
+
+IADL `CLOSE_THEN_REVERSE` and `UNWIND_STRADDLE` queue orders without checking `EXEC_LOCKED`, potentially sending sell+buy plan orders while another order is in-flight.
+
+**Fix:**
+```python
+if _iadl_dec.plan and not SIMULATION_MODE and not EXEC_LOCKED:
+```
+
+---
+
+## 🟡 Bug 7 — Flat windows skip [settle_window](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#483-610) → statistical bias
+
+**[main.py:3552-3554](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#L3552-L3554)**
+
+If all positions exited before window end, [settle_window()](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#483-610) never fires. [record_pnl(0.0)](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#209-249) is skipped, so SPRT and rolling Sharpe never see zero-return windows — mild upward bias in rolling Sharpe.
+
+---
+
+## 🟢 Bug 8 — Dead `if/else` branch in [_process_book_update](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#3024-3234)
+
+**[main.py:3196-3218](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#L3194-L3218)**
+
+Both `if existing:` and `else:` branches call `BOOK_CACHE.update()` with identical arguments. Remove the branch.
+
+---
+
+## 🟢 Bug 9 — Duplicate comment (lines 5392-5393)
+
+```
+# Auto-release stuck lock after 5 seconds
+# Auto-release stuck lock after 5 seconds
+```
+
+---
+
+## 🟢 Bug 10 — L2 data not updated on `price_changes` deltas
+
+`bids_l2`/`asks_l2` arrays are only set on full snapshots (line 3105-3112). The `price_changes` handler (line 3123-3161) updates top-of-book but leaves L2 stale, affecting [depth_decayed_imbalance()](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#1052-1076).
+
+---
+
+## Summary
+
+| # | Severity | Area | Issue |
+|---|----------|------|-------|
+| 1 | 🔴 High | Flip logic | Wrong `p_cone`/[side](file:///c:/Users/brock/Downloads/303-main/303-main/main.py#933-936) in profit gate |
+| 2 | 🔴 High | Flow tracking | Unknown-side trades recorded as sells |
+| 3 | 🔴 High | Kelly sizing | Variable shadowing mixes sigma ratios |
+| 4 | 🟡 Med | Survival | Only one leg exited in last-8s straddle |
+| 5 | 🟡 Med | Circuit breaker | Duplicate check with ambiguous intent |
+| 6 | 🟡 Med | IADL | Multi-order plans bypass EXEC_LOCKED |
+| 7 | 🟡 Med | Settlement | Flat windows skip settle → Sharpe bias |
+| 8 | 🟢 Low | Book update | Dead if/else branch |
+| 9 | 🟢 Low | Comments | Duplicate comment |
+| 10 | 🟢 Low | Book update | L2 stale on delta updates |
