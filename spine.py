@@ -144,6 +144,7 @@ class DecisionSpine:
     def decide(self, f: Features) -> Optional[Decision]:
         side = str(f.side).upper()
         now = int(f.now_ms)
+        available_qty = float(max(0.0, f.available_qty))
 
         # 0) One decision per side per tick (debounce)
         if now - self._last_decision_ms.get(side, 0) < self._decision_cooldown_ms:
@@ -181,6 +182,10 @@ class DecisionSpine:
         # EXIT PATH (if we have inventory)
         # ─────────────────────────────────────────
         if f.inventory > 0 and f.bid > 0.01:
+            # Never route an exit when all inventory is already in-flight.
+            if available_qty <= 0.0:
+                return None
+
             # 3) THESIS BROKEN — immediate thesis exit (overrides gamma)
             if bool(f.thesis_broken):
                 self._exit_locked_until_ms[side] = now + self._exit_lock_ms
@@ -188,7 +193,7 @@ class DecisionSpine:
                     action="SELL",
                     side=side,
                     token_id=f.token_id,
-                    size=float(max(0.0, f.available_qty or f.inventory)),
+                    size=available_qty,
                     price=float(f.bid),
                     mode="thesis_exit",
                     reason="thesis_broken",
@@ -216,7 +221,7 @@ class DecisionSpine:
                     side=side,
                     bid=float(f.bid),
                     opp_ask=float(f.opp_best_ask),
-                    size=float(max(0.0, f.available_qty or f.inventory)),
+                    size=available_qty,
                     offset=float(f.sis_offset or 0.0),
                 )
                 if syn.get("use_synthetic"):
@@ -225,7 +230,7 @@ class DecisionSpine:
                         action="BUY",
                         side=("DOWN" if side == "UP" else "UP"),
                         token_id=str(f.opp_token_id),
-                        size=float(max(0.0, f.available_qty or f.inventory)),
+                        size=available_qty,
                         price=float(syn["synthetic_price"]),
                         mode="synthetic_exit",
                         reason="synthetic_dominates_direct_sell",
@@ -244,7 +249,7 @@ class DecisionSpine:
             if f.exit_reason:
                 # Use SIS fraction if present; otherwise full exit
                 frac = float(f.sis_frac) if f.sis_frac and f.sis_frac > 0 else 1.0
-                size = float(max(0.0, (f.available_qty or f.inventory) * frac))
+                size = float(max(0.0, available_qty * frac))
 
                 if size > 0:
                     self._exit_locked_until_ms[side] = now + self._exit_lock_ms
